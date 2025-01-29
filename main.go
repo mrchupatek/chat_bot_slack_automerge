@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// RespBodyMR Структура ответа от GitLab API для Merge Request
+// RespBodyMR Структура ответа от GitLab API для Merge R equest
 type RespBodyMR struct {
 	ID             int         `json:"id"`
 	Iid            int         `json:"iid"`
