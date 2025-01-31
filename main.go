@@ -110,12 +110,13 @@ var userSelectionButtons = make(map[string]string)
 
 // MRPayload Структура для создания Merge Request
 type MRPayload struct {
-	ID                 int    `json:"id"`
-	SourceBranch       string `json:"source_branch"`
-	TargetBranch       string `json:"target_branch"`
-	RemoveSourceBranch bool   `json:"remove_source_branch"`
-	Title              string `json:"title"`
-	Squash             bool   `json:"squash"`
+	ID                 int      `json:"id"`
+	SourceBranch       string   `json:"source_branch"`
+	TargetBranch       string   `json:"target_branch"`
+	RemoveSourceBranch bool     `json:"remove_source_branch"`
+	Title              string   `json:"title"`
+	Squash             bool     `json:"squash"`
+	Labels             []string `json:"labels"`
 }
 
 type MergeData struct {
@@ -132,7 +133,7 @@ func main() {
 	appToken := os.Getenv("SLACK_APP_TOKEN")
 
 	// Инициализация Slack клиента
-	fmt.Println("⏳ Chat bot starting...")
+	log.Println("⏳ Chat bot starting...")
 	client := slack.New(token, slack.OptionDebug(false), slack.OptionAppLevelToken(appToken))
 
 	socketClient := socketmode.New(
@@ -186,7 +187,7 @@ func main() {
 			}
 		}
 	}(ctx, client, socketClient)
-	fmt.Println("✅ Chat bot started")
+	log.Println("✅ Chat bot started")
 
 	socketClient.Run()
 }
@@ -278,14 +279,18 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 	clientResp, err := CreateMR(clientBranch, mrData["client"])
 	if err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for client `%s`. \n"+
-			"❌ Error: `%s`", clientBranch, err), false))
+			"❌ Error: `%v`", clientBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", clientBranch, err)
 		return
 	}
 
 	serverResp, err := CreateMR(serverBranch, mrData["server"])
 	if err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for server `%s`. \n"+
-			"❌ Error: `%s`", serverBranch, err), false))
+			"❌ Error: `%v`", serverBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", serverBranch, err)
 		return
 	}
 
@@ -295,12 +300,17 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 			"🔸 Server project branch: `%s` (MR ID: `%d`) \n"+
 			"⏳ Checking mergeability...",
 		clientBranch, clientResp.Iid, serverBranch, serverResp.Iid), false))
-
+	log.Printf("✅ Merge requests created: \n"+
+		"🔹 Client project branch: `%s` (MR ID: `%d`) \n"+
+		"🔸 Server project branch: `%s` (MR ID: `%d`)",
+		clientBranch, clientResp.Iid, serverBranch, serverResp.Iid)
 	// Проверяем оба MR
 	if rsp, err := WaitForStatus(clientResp.Iid, mrData["client"]); err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Client MR cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
-			"❌ Error: `%s`", clientBranch, rsp.WebURL, clientResp.Iid, err), false))
+			"❌ Error: `%v`", clientBranch, rsp.WebURL, clientResp.Iid, err), false))
+		log.Printf("❌ Client MR cannot be merged `%s`, iid `%d`. \n"+
+			"❌ Error: %v\n", clientBranch, clientResp.Iid, err)
 		return
 	}
 
@@ -308,6 +318,8 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Server MR cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
 			"❌ Error: `%s`", serverBranch, rsp.WebURL, serverResp.Iid, err), false))
+		log.Printf("❌ Client MR cannot be merged `%s`, iid `%d`. \n"+
+			"❌ Error: %v\n", serverBranch, serverResp.Iid, err)
 		return
 	}
 
@@ -316,6 +328,8 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 	if err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Client MR `%s`. \n"+
 			"❌ Error: `%s`", clientBranch, err), false))
+		log.Printf("❌ Error merging Client MR `%s` \n"+
+			"❌ Error: %v\n", clientBranch, err)
 		return
 	}
 
@@ -323,6 +337,8 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 	if err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Server MR `%s`. \n"+
 			"❌ Error: `%s`", serverBranch, err), false))
+		log.Printf("❌ Error merging Server MR `%s` \n"+
+			"❌ Error: %v\n", serverBranch, err)
 		return
 	}
 
@@ -331,6 +347,10 @@ func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, clie
 			"🔹 Client MR `%s` -> `%s` \n"+
 			"🔸 Server MR `%s` -> `%s`",
 		clientBranch, clientMR.State, serverBranch, serverMR.State), false))
+	log.Printf("✅ Merge completed: \n"+
+		"🔹 Client MR `%s` -> `%s` \n"+
+		"🔸 Server MR `%s` -> `%s`",
+		clientBranch, clientMR.State, serverBranch, serverMR.State)
 }
 
 // WaitForStatus Ждем результатов
@@ -361,7 +381,9 @@ func CreateMerge(channelID, branchName, buttonValue string, client *slack.Client
 	resp, err := CreateMR(branchName, mrData[buttonValue])
 	if err != nil {
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be create mr `%s`. \n"+
-			"❌ Error: `%s`", branchName, err), false))
+			"❌ Error: `%v`", branchName, err), false))
+		log.Printf("❌ Cannot be create mr `%s`. \n"+
+			"❌ Error: `%v`", branchName, err)
 		return
 	}
 
@@ -371,11 +393,16 @@ func CreateMerge(channelID, branchName, buttonValue string, client *slack.Client
 			"⏳ Checking mergeability... (MR ID: `%d`)",
 		branchName, resp.Iid), false))
 
+	log.Printf("✅ Merge request for branch `%s` created. (MR ID: `%d`)",
+		branchName, resp.Iid)
+
 	if rsp, err := WaitForStatus(resp.Iid, mrData[buttonValue]); err != nil {
 		fmt.Println("Ошибка:", err)
 		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
-			"❌ Error: `%s`", branchName, rsp.WebURL, resp.Iid, err), false))
+			"❌ Error: `%v`", branchName, rsp.WebURL, resp.Iid, err), false))
+		log.Printf("❌ Cannot be merged `%s`. MR %d. \n"+
+			"❌ Error: `%v`", branchName, resp.Iid, err)
 		return
 	}
 
@@ -383,9 +410,10 @@ func CreateMerge(channelID, branchName, buttonValue string, client *slack.Client
 	if err != nil {
 		return
 	}
-	fmt.Println("✅ Merge request completed", mr.State)
 
-	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("✅ Merge for branch `%s` completed. State MR: `%s`", branchName, mr.State), false))
+	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("✅ Merge for branch `%s` completed. State MR: `%s`",
+		branchName, mr.State), false))
+	log.Printf("✅ Merge for branch `%s` completed. State MR: `%s`", branchName, mr.State)
 }
 
 // CreateMR Создаем МР через апи
@@ -407,8 +435,9 @@ func CreateMR(branchName string, projectID int) (*RespBodyMR, error) {
 		SourceBranch:       "master",
 		TargetBranch:       branchName,
 		RemoveSourceBranch: true,
-		Title:              "automerge_mester_to_" + branchName + "_" + time.Now().Format("2006-01-02 15:04:05"),
+		Title:              "Auto-merge `master` into `" + branchName + "` branch",
 		Squash:             false,
+		Labels:             []string{"automerge", "bot"},
 	}
 
 	jsonData, err := json.Marshal(data)
@@ -640,11 +669,13 @@ func HandleAppMentionEventToBot(event *slackevents.AppMentionEvent, client *slac
 
 	case strings.Contains(text, "delete_all") && strings.Contains(text, "666"):
 		client.PostMessage(event.Channel, slack.MsgOptionText("🔄 Deleting all messages...", false))
+		log.Println("🔄 Deleting all messages...")
 		err := DeleteAllMessages(event.Channel, client)
 		if err != nil {
 			client.PostMessage(event.Channel, slack.MsgOptionText(fmt.Sprintf("❌ Error deleting messages: %s", err), false))
 		} else {
 			client.PostMessage(event.Channel, slack.MsgOptionText("✅ All messages have been deleted!", false))
+			log.Println("✅ All messages have been deleted!")
 		}
 		return nil
 
