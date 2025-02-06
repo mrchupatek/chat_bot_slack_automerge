@@ -151,19 +151,19 @@ func InitDB() (*sql.DB, error) {
 	return db, nil
 }
 
-// Добавление задачи в cron-таблицу
+// AddCronTask Добавление задачи в cron-таблицу
 func AddCronTask(db *sql.DB, userID, branch, project string) error {
 	_, err := db.Exec("INSERT INTO cron_merge (user_id, branch, project) VALUES (?, ?, ?)", userID, branch, project)
 	return err
 }
 
-// Удаление задачи из cron-таблицы
+// DeleteCronTask Удаление задачи из cron-таблицы
 func DeleteCronTask(db *sql.DB, userID, branch, project string) error {
 	_, err := db.Exec("DELETE FROM cron_merge WHERE user_id = ? AND branch = ? AND project = ?", userID, branch, project)
 	return err
 }
 
-// Получение всех задач для пользователя
+// GetCronTasks Получение всех задач для пользователя
 func GetCronTasks(db *sql.DB, userID string) ([]map[string]interface{}, error) {
 
 	rows, err := db.Query("SELECT id, branch, project FROM cron_merge WHERE user_id = ?", userID)
@@ -775,6 +775,7 @@ func HandleEventMessage(event slackevents.EventsAPIEvent, client *slack.Client) 
 	return nil
 }
 
+// DeleteAllMessages Удаление всех последних сообщений бота
 func DeleteAllMessages(channelID string, client *slack.Client) error {
 	history, err := client.GetConversationHistory(&slack.GetConversationHistoryParameters{
 		ChannelID: channelID,
