@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-co-op/gocron"
 	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -108,14 +111,17 @@ type RespBodyMR struct {
 // userSelectionButtons Словарь для хранения выбора пользователя
 var userSelectionButtons = make(map[string]string)
 
+var projectIDGitlab = map[string]int{"client": 66, "server": 65}
+
 // MRPayload Структура для создания Merge Request
 type MRPayload struct {
-	ID                 int    `json:"id"`
-	SourceBranch       string `json:"source_branch"`
-	TargetBranch       string `json:"target_branch"`
-	RemoveSourceBranch bool   `json:"remove_source_branch"`
-	Title              string `json:"title"`
-	Squash             bool   `json:"squash"`
+	ID                 int      `json:"id"`
+	SourceBranch       string   `json:"source_branch"`
+	TargetBranch       string   `json:"target_branch"`
+	RemoveSourceBranch bool     `json:"remove_source_branch"`
+	Title              string   `json:"title"`
+	Squash             bool     `json:"squash"`
+	Labels             []string `json:"labels"`
 }
 
 type MergeData struct {
@@ -124,71 +130,150 @@ type MergeData struct {
 	Squash          bool   `json:"squash"`
 }
 
-func main() {
-	// Загружаем переменные окружения
-	godotenv.Load(".env")
+// InitDB Создание базы данных для хранения cron-задач
+func InitDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", "automerge.db")
+	if err != nil {
+		return nil, err
+	}
+	_, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS cron_merge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            branch TEXT,
+            project TEXT
+        );`)
+	if err != nil {
+		return nil, err
+	}
 
-	token := os.Getenv("SLACK_AUTH_TOKEN")
-	appToken := os.Getenv("SLACK_APP_TOKEN")
+	log.Println("✅ The database has been initialized.")
+	return db, nil
+}
 
-	// Инициализация Slack клиента
-	fmt.Println("⏳ Chat bot starting...")
-	client := slack.New(token, slack.OptionDebug(false), slack.OptionAppLevelToken(appToken))
+// AddCronTask Добавление задачи в cron-таблицу
+func AddCronTask(db *sql.DB, userID, branch, project string) error {
+	_, err := db.Exec("INSERT INTO cron_merge (user_id, branch, project) VALUES (?, ?, ?)", userID, branch, project)
+	return err
+}
 
-	socketClient := socketmode.New(
-		client,
-		socketmode.OptionDebug(false),
-		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
-	)
+// DeleteCronTask Удаление задачи из cron-таблицы
+func DeleteCronTask(db *sql.DB, userID, branch, project string) error {
+	_, err := db.Exec("DELETE FROM cron_merge WHERE user_id = ? AND branch = ? AND project = ?", userID, branch, project)
+	return err
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
+// GetCronTasks Получение всех задач для пользователя
+func GetCronTasks(db *sql.DB, userID string) ([]map[string]interface{}, error) {
 
-	defer cancel()
+	rows, err := db.Query("SELECT id, branch, project FROM cron_merge WHERE user_id = ?", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-	// Запуск обработчика событий в отдельной горутине
-	go func(ctx context.Context, client *slack.Client, socketClient *socketmode.Client) {
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("🛑 Shutting down socketmode listener")
-				return
-			case event := <-socketClient.Events:
-
-				switch event.Type {
-
-				case socketmode.EventTypeInteractive:
-					callback, ok := event.Data.(slack.InteractionCallback)
-					if !ok {
-						log.Printf("⚠️ Ignored non-interactive callback event: %v\n", event)
-						continue
-					}
-
-					socketClient.Ack(*event.Request)
-					err := HandleInteractiveEvent(callback, client)
-					if err != nil {
-						log.Printf("❌ Error handling interactive event: %v\n", err)
-					}
-
-				case socketmode.EventTypeEventsAPI:
-
-					eventsAPI, ok := event.Data.(slackevents.EventsAPIEvent)
-					if !ok {
-						log.Printf("⚠️ Could not type cast the event to the EventsAPI: %v\n", event)
-						continue
-					}
-
-					socketClient.Ack(*event.Request)
-					err := HandleEventMessage(eventsAPI, client)
-					if err != nil {
-						log.Fatal(err)
-					}
-				}
-			}
+	var tasks []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var branch, project string
+		if err := rows.Scan(&id, &branch, &project); err != nil {
+			return nil, err
 		}
-	}(ctx, client, socketClient)
-	fmt.Println("✅ Chat bot started")
+		tasks = append(tasks, map[string]interface{}{
+			"id":      id,
+			"branch":  branch,
+			"project": project,
+		})
+	}
+	return tasks, nil
+}
 
-	socketClient.Run()
+// StartCronWorker Горутина для выполнения задач в 9 утра по МСК
+func StartCronWorker(db *sql.DB, client *slack.Client) {
+	scheduler := gocron.NewScheduler(time.UTC)
+	scheduler.Every(1).Day().At("07:43").Do(func() { // 9 AM MSK = 6 AM UTC
+		rows, err := db.Query("SELECT user_id, branch, project FROM cron_merge")
+		if err != nil {
+			log.Printf("❌ Error retrieving cron tasks: %v", err)
+			return
+		}
+		defer rows.Close()
+
+		hasRows := rows.Next()
+		if !hasRows {
+			log.Println("⚠️ No scheduled auto-merge tasks.")
+			return
+		}
+
+		rows.Close()
+		rows, err = db.Query("SELECT user_id, branch, project FROM cron_merge")
+		if err != nil {
+			log.Printf("❌ Error retrieving cron tasks again: %v", err)
+			return
+		}
+
+		for rows.Next() {
+			var userID, branch, project string
+			if err := rows.Scan(&userID, &branch, &project); err != nil {
+				log.Printf("❌ Error reading task: %v", err)
+				continue
+			}
+
+			projectID, exists := projectIDGitlab[project]
+			if !exists {
+				log.Printf("❌ Unknown project: %s", project)
+				sendSlackError(client, userID, fmt.Sprintf("❌ Error: Unknown project `%s`.", project))
+				continue
+			}
+
+			log.Printf("⏳ Auto-merge for %s, branch %s, project %s", userID, branch, project)
+			resp, err := CreateMR(branch, projectID)
+			if err != nil {
+				log.Printf("❌ Error creating MR for %s: %v", userID, err)
+				sendSlackError(client, userID, fmt.Sprintf("❌ Error creating MR for branch `%s` in project `%s`.\n"+
+					"Error: `%v`", branch, project, err))
+				continue
+			}
+
+			waitResp, err := WaitForStatus(resp.Iid, projectID)
+			if err != nil {
+				log.Printf("❌ Error waiting for MR status for %s: %v", userID, err)
+				sendSlackError(client, userID, fmt.Sprintf(
+					"❌ Error waiting for MR status for branch `%s` in project `%s`.\n"+
+						"⚠️ Check your merge request: <%s|Merge Request #%d>.\n"+
+						"Error: `%v`",
+					branch, project, waitResp.WebURL, resp.Iid, err))
+				continue
+			}
+
+			_, err = MergeMR(resp.Iid, projectID)
+			if err != nil {
+				log.Printf("❌ Error merging MR for %s: %v", userID, err)
+				sendSlackError(client, userID, fmt.Sprintf("❌ Error merging MR for branch `%s` in project `%s`.\n"+
+					"Error: `%v`", branch, project, err))
+				continue
+			}
+
+			log.Printf("✅ Auto-merge completed successfully for %s, branch %s, project %s", userID, branch, project)
+			sendSlackSuccess(client, userID, fmt.Sprintf("✅ Auto-merge completed successfully for branch `%s` in project `%s`.",
+				branch, project))
+		}
+	})
+	scheduler.StartAsync()
+}
+
+func sendSlackError(client *slack.Client, userID, message string) {
+	_, _, err := client.PostMessage(userID, slack.MsgOptionText(fmt.Sprintf("<@%s> %s", userID, message), false))
+	if err != nil {
+		log.Printf("❌ Error sending bug to Slack for user %s: %v", userID, err)
+	}
+}
+
+func sendSlackSuccess(client *slack.Client, userID, message string) {
+	_, _, err := client.PostMessage(userID, slack.MsgOptionText(fmt.Sprintf("<@%s> %s", userID, message), false))
+	if err != nil {
+		log.Printf("⚠️ Error sending message in Slack to user %s: %v", userID, err)
+	}
 }
 
 // HandleInteractiveEvent Обработчик интерактивных событий (нажатие кнопок)
@@ -252,6 +337,7 @@ func HandleInteractiveEvent(callback slack.InteractionCallback, client *slack.Cl
 				return err
 			}
 		}
+
 	case "chosen_branch":
 		if len(callback.Submission) > 0 {
 			buttonValue := userSelectionButtons[callback.User.ID]
@@ -260,132 +346,340 @@ func HandleInteractiveEvent(callback slack.InteractionCallback, client *slack.Cl
 				// Получаем две ветки
 				clientBranch := callback.Submission["client_branch"]
 				serverBranch := callback.Submission["server_branch"]
-				CreateMergeForAllProject(callback.Channel.ID, clientBranch, serverBranch, client)
+				CreateMergeForAllProject(callback.Channel.ID, clientBranch, serverBranch, callback.User.ID, client)
 			} else {
 				// Обычное поведение для одной ветки
 				branchName := callback.Submission["branch_name"]
-				CreateMerge(callback.Channel.ID, branchName, buttonValue, client)
+				CreateMerge(callback.Channel.ID, branchName, buttonValue, callback.User.ID, client)
 			}
+		}
+
+	case "cron_add_task":
+		db, err := InitDB()
+		if err != nil {
+			log.Fatalf("❌ Database initialization error: %v", err)
+		}
+		branch := callback.Submission["branch_name"]
+		project := callback.Submission["project"]
+
+		if branch == "" || project == "" {
+			return errors.New("❌ Branch or project not specified")
+		}
+
+		err = AddCronTask(db, callback.User.ID, branch, project)
+		if err != nil {
+			log.Printf("❌ Error adding task to DB: %v", err)
+			return err
+		}
+
+		client.PostEphemeral(callback.Channel.ID, callback.User.ID, slack.MsgOptionText(fmt.Sprintf("✅ "+
+			"Automerge task for branch `%s` for `%s` added!", branch, project), false))
+
+	case "cron_task":
+		if len(callback.ActionCallback.AttachmentActions) > 0 {
+			action := callback.ActionCallback.AttachmentActions[0]
+
+			if action.Name == "add_cron" {
+				// Открываем диалог для добавления задачи
+				dialog := slack.Dialog{
+					CallbackID:  "cron_add_task",
+					Title:       "Add task to Auto-Merge",
+					SubmitLabel: "Submit",
+					Elements: []slack.DialogElement{
+						slack.TextInputElement{
+							DialogInput: slack.DialogInput{
+								Type:  "text",
+								Name:  "branch_name",
+								Label: "Branch name",
+							},
+						},
+						slack.DialogInputSelect{
+							DialogInput: slack.DialogInput{
+								Type:  "select",
+								Name:  "project",
+								Label: "Project",
+							},
+							Options: []slack.DialogSelectOption{
+								{Label: "Client", Value: "client"},
+								{Label: "Server", Value: "server"},
+							},
+						},
+					},
+				}
+				err := client.OpenDialog(callback.TriggerID, dialog)
+				if err != nil {
+					log.Printf("❌ Error opening dialog: %v", err)
+					return err
+				}
+			}
+
+			if action.Name == "delete_cron" {
+				db, err := InitDB()
+				if err != nil {
+					log.Fatalf("❌ Database initialization error: %v", err)
+				}
+
+				tasks, err := GetCronTasks(db, callback.User.ID)
+				if err != nil || len(tasks) == 0 {
+					client.PostEphemeral(callback.Channel.ID, callback.User.ID, slack.MsgOptionText("⚠️"+
+						" There are no tasks to delete.", false))
+					_, _, err := client.DeleteMessage(callback.Channel.ID, callback.MessageTs)
+					if err != nil {
+						return err
+					}
+					return nil
+				}
+
+				var options []slack.DialogSelectOption
+				for _, task := range tasks {
+					text := fmt.Sprintf("%s (%s)", task["branch"], task["project"])
+					value := fmt.Sprintf("%s|%s", task["branch"], task["project"])
+					options = append(options, slack.DialogSelectOption{Label: text, Value: value})
+				}
+
+				dialog := slack.Dialog{
+					CallbackID:  "cron_delete_task",
+					Title:       "Delete task",
+					SubmitLabel: "Delete",
+					Elements: []slack.DialogElement{
+						slack.DialogInputSelect{
+							DialogInput: slack.DialogInput{
+								Type:  "select",
+								Name:  "task",
+								Label: "Select a task to delete",
+							},
+							Options: options,
+						},
+					},
+				}
+
+				err = client.OpenDialog(callback.TriggerID, dialog)
+				if err != nil {
+					log.Printf("❌ Error opening dialog: %v", err)
+					return err
+				}
+			}
+			_, _, err := client.DeleteMessage(callback.Channel.ID, callback.MessageTs)
+			if err != nil {
+				return err
+			}
+		}
+
+	case "cron_delete_task":
+		if len(callback.Submission) > 0 {
+			db, err := InitDB()
+			if err != nil {
+				log.Fatalf("❌ Error initializing database: %v", err)
+			}
+
+			taskValue := callback.Submission["task"]
+			parts := strings.Split(taskValue, "|")
+			if len(parts) != 2 {
+				return errors.New("❌ Error: Invalid task data format")
+			}
+			branch, project := parts[0], parts[1]
+
+			err = DeleteCronTask(db, callback.User.ID, branch, project)
+			if err != nil {
+				log.Printf("❌ Error deleting task: %v", err)
+				client.PostEphemeral(callback.Channel.ID, callback.User.ID, slack.MsgOptionText(fmt.Sprintf("❌"+
+					" Error deleting task `%s` (%s)", branch, project), false))
+				return err
+			}
+
+			client.PostEphemeral(callback.Channel.ID, callback.User.ID, slack.MsgOptionText(fmt.Sprintf("🗑️"+
+				" Task `%s` (%s) removed.", branch, project), false))
+		}
+
+	case "add_cron":
+		dialog := slack.Dialog{
+			CallbackID:  "cron_add_task",
+			Title:       "Add task to Auto-Merge",
+			SubmitLabel: "Submit",
+			Elements: []slack.DialogElement{
+				slack.TextInputElement{
+					DialogInput: slack.DialogInput{
+						Type:  "text",
+						Name:  "branch_name",
+						Label: "Branch name",
+					},
+				},
+				slack.SelectBlockElement{
+					Type: "static_select",
+					Options: []*slack.OptionBlockObject{
+						{
+							Text:  slack.NewTextBlockObject("plain_text", "Client", false, false),
+							Value: "client",
+						},
+						{
+							Text:  slack.NewTextBlockObject("plain_text", "Server", false, false),
+							Value: "server",
+						},
+					},
+				},
+			},
+		}
+
+		err := client.OpenDialog(callback.TriggerID, dialog)
+		if err != nil {
+			log.Printf("❌ Error opening dialog: %v", err)
+			return err
 		}
 	}
 	return nil
 }
 
 // CreateMergeForAllProject Создаем МР для всех проектов
-func CreateMergeForAllProject(channelID, clientBranch, serverBranch string, client *slack.Client) {
-	mrData := map[string]int{"client": 66, "server": 65}
+func CreateMergeForAllProject(channelID, clientBranch, serverBranch, userID string, client *slack.Client) {
 
-	clientResp, err := CreateMR(clientBranch, mrData["client"])
+	clientResp, err := CreateMR(clientBranch, projectIDGitlab["client"])
 	if err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for client `%s`. \n"+
-			"❌ Error: `%s`", clientBranch, err), false))
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for client `%s`. \n"+
+			"❌ Error: `%v`", clientBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", clientBranch, err)
 		return
 	}
 
-	serverResp, err := CreateMR(serverBranch, mrData["server"])
+	serverResp, err := CreateMR(serverBranch, projectIDGitlab["server"])
 	if err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for server `%s`. \n"+
-			"❌ Error: `%s`", serverBranch, err), false))
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for server `%s`. \n"+
+			"❌ Error: `%v`", serverBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", serverBranch, err)
 		return
 	}
 
-	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf(
+	client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf(
 		"✅ Merge requests created: \n"+
 			"🔹 Client project branch: `%s` (MR ID: `%d`) \n"+
 			"🔸 Server project branch: `%s` (MR ID: `%d`) \n"+
-			"⏳ Checking mergeability...",
+			"⏳ Checking mergeability(about 5 minutes)...",
 		clientBranch, clientResp.Iid, serverBranch, serverResp.Iid), false))
-
+	log.Printf("✅ Merge requests created: \n"+
+		"🔹 Client project branch: `%s` (MR ID: `%d`) \n"+
+		"🔸 Server project branch: `%s` (MR ID: `%d`)",
+		clientBranch, clientResp.Iid, serverBranch, serverResp.Iid)
 	// Проверяем оба MR
-	if rsp, err := WaitForStatus(clientResp.Iid, mrData["client"]); err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Client MR cannot be merged `%s`. \n"+
+	if rsp, err := WaitForStatus(clientResp.Iid, projectIDGitlab["client"]); err != nil {
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Client MR cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
-			"❌ Error: `%s`", clientBranch, rsp.WebURL, clientResp.Iid, err), false))
+			"❌ Error: `%v`", clientBranch, rsp.WebURL, clientResp.Iid, err), false))
+		log.Printf("❌ Client MR cannot be merged `%s`, iid `%d`. \n"+
+			"❌ Error: %v\n", clientBranch, clientResp.Iid, err)
 		return
 	}
 
-	if rsp, err := WaitForStatus(serverResp.Iid, mrData["server"]); err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Server MR cannot be merged `%s`. \n"+
+	if rsp, err := WaitForStatus(serverResp.Iid, projectIDGitlab["server"]); err != nil {
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Server MR cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
 			"❌ Error: `%s`", serverBranch, rsp.WebURL, serverResp.Iid, err), false))
+		log.Printf("❌ Client MR cannot be merged `%s`, iid `%d`. \n"+
+			"❌ Error: %v\n", serverBranch, serverResp.Iid, err)
 		return
 	}
 
 	// Если оба MR "mergeable", выполняем MergeMR
-	clientMR, err := MergeMR(clientResp.Iid, mrData["client"])
+	clientMR, err := MergeMR(clientResp.Iid, projectIDGitlab["client"])
 	if err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Client MR `%s`. \n"+
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Client MR `%s`. \n"+
 			"❌ Error: `%s`", clientBranch, err), false))
+		log.Printf("❌ Error merging Client MR `%s` \n"+
+			"❌ Error: %v\n", clientBranch, err)
 		return
 	}
 
-	serverMR, err := MergeMR(serverResp.Iid, mrData["server"])
+	serverMR, err := MergeMR(serverResp.Iid, projectIDGitlab["server"])
 	if err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Server MR `%s`. \n"+
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Error merging Server MR `%s`. \n"+
 			"❌ Error: `%s`", serverBranch, err), false))
+		log.Printf("❌ Error merging Server MR `%s` \n"+
+			"❌ Error: %v\n", serverBranch, err)
 		return
 	}
 
-	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf(
+	client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf(
 		"✅ Merge completed: \n"+
 			"🔹 Client MR `%s` -> `%s` \n"+
 			"🔸 Server MR `%s` -> `%s`",
 		clientBranch, clientMR.State, serverBranch, serverMR.State), false))
+	log.Printf("✅ Merge completed: \n"+
+		"🔹 Client MR `%s` -> `%s` \n"+
+		"🔸 Server MR `%s` -> `%s`",
+		clientBranch, clientMR.State, serverBranch, serverMR.State)
 }
 
-// WaitForStatus Ждем результатов
 func WaitForStatus(iid, projectID int) (*RespBodyMR, error) {
-	for i := 0; i < 3; i++ {
+	deadline := time.Now().Add(120 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastResp *RespBodyMR
+
+	for time.Now().Before(deadline) {
 		resp, err := CheckMR(iid, projectID)
 		if err != nil {
 			return resp, err
 		}
-		if resp.DetailedMergeStatus == "mergeable" {
+		lastResp = resp
+
+		switch resp.DetailedMergeStatus {
+		case "mergeable":
 			return resp, nil
+		case "checking":
+			<-ticker.C
+			continue
 		}
+
 		if resp.MergeStatus == "cannot_be_merged" {
 			return resp, errors.New("cannot_be_merged")
 		}
-		if i < 2 {
-			time.Sleep(3 * time.Second)
-		}
+
+		<-ticker.C
 	}
-	return nil, errors.New("timeout")
+
+	return lastResp, errors.New("timeout")
 }
 
 // CreateMerge Главная функция логики создания и выполнения МР
-func CreateMerge(channelID, branchName, buttonValue string, client *slack.Client) {
+func CreateMerge(channelID, branchName, buttonValue, userID string, client *slack.Client) {
 
-	mrData := map[string]int{"client": 66, "server": 65}
-
-	resp, err := CreateMR(branchName, mrData[buttonValue])
+	resp, err := CreateMR(branchName, projectIDGitlab[buttonValue])
 	if err != nil {
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be create mr `%s`. \n"+
-			"❌ Error: `%s`", branchName, err), false))
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be create mr `%s`. \n"+
+			"❌ Error: `%v`", branchName, err), false))
+		log.Printf("❌ Cannot be create mr `%s`. \n"+
+			"❌ Error: `%v`", branchName, err)
 		return
 	}
 
-	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf(
-		"✅ Merge request for branch `%s` created. \n"+
-			"🛠 Please wait 🛠 \n "+
+	client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf(
+		"✅ Merge request for `%s` branch `%s` created. \n"+
+			"🛠 Please wait, about 5 minutes  🛠 \n "+
 			"⏳ Checking mergeability... (MR ID: `%d`)",
-		branchName, resp.Iid), false))
+		buttonValue, branchName, resp.Iid), false))
 
-	if rsp, err := WaitForStatus(resp.Iid, mrData[buttonValue]); err != nil {
+	log.Printf("✅ Merge request for `%s` branch `%s` created. (MR ID: `%d`)",
+		buttonValue, branchName, resp.Iid)
+
+	if rsp, err := WaitForStatus(resp.Iid, projectIDGitlab[buttonValue]); err != nil {
 		fmt.Println("Ошибка:", err)
-		client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be merged `%s`. \n"+
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be merged `%s`. \n"+
 			"⚠️ Check your merge request: <%s|Merge Request #%d>. \n"+
-			"❌ Error: `%s`", branchName, rsp.WebURL, resp.Iid, err), false))
+			"❌ Error: `%v`", branchName, rsp.WebURL, resp.Iid, err), false))
+		log.Printf("❌ Cannot be merged `%s`. MR %d. \n"+
+			"❌ Error: `%v`", branchName, resp.Iid, err)
 		return
 	}
 
-	mr, err := MergeMR(resp.Iid, mrData[buttonValue])
+	mr, err := MergeMR(resp.Iid, projectIDGitlab[buttonValue])
 	if err != nil {
 		return
 	}
-	fmt.Println("✅ Merge request completed", mr.State)
 
-	client.PostMessage(channelID, slack.MsgOptionText(fmt.Sprintf("✅ Merge for branch `%s` completed. State MR: `%s`", branchName, mr.State), false))
+	client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("✅ Merge for `%s` branch `%s` completed. "+
+		"State MR: `%s`", buttonValue, branchName, mr.State), false))
+	log.Printf("✅ Merge for `%s` branch `%s` completed. State MR: `%s`", buttonValue, branchName, mr.State)
 }
 
 // CreateMR Создаем МР через апи
@@ -407,8 +701,9 @@ func CreateMR(branchName string, projectID int) (*RespBodyMR, error) {
 		SourceBranch:       "master",
 		TargetBranch:       branchName,
 		RemoveSourceBranch: true,
-		Title:              "automerge_mester_to_" + branchName + "_" + time.Now().Format("2006-01-02 15:04:05"),
+		Title:              "Auto-merge `master` into `" + branchName + "` branch",
 		Squash:             false,
+		Labels:             []string{"automerge", "bot"},
 	}
 
 	jsonData, err := json.Marshal(data)
@@ -568,7 +863,7 @@ func HandleEventMessage(event slackevents.EventsAPIEvent, client *slack.Client) 
 			branchName := strings.TrimSpace(evnt.Text)
 			if branchName != "" {
 				selectedValue := userSelectionButtons[evnt.User]
-				CreateMerge(evnt.Channel, branchName, selectedValue, client)
+				CreateMerge(evnt.Channel, branchName, selectedValue, evnt.User, client)
 			}
 		case *slackevents.AppMentionEvent:
 			if err := HandleAppMentionEventToBot(evnt, client); err != nil {
@@ -631,6 +926,41 @@ func HandleAppMentionEventToBot(event *slackevents.AppMentionEvent, client *slac
 			},
 		}
 
+	case strings.Contains(text, "cron") || strings.Contains(text, "cr"):
+		db, err := InitDB()
+		if err != nil {
+			log.Fatalf("❌ Database initialization error: %v", err)
+		}
+
+		tasks, err := GetCronTasks(db, event.User)
+		if err != nil {
+			client.PostEphemeral(event.Channel, event.User, slack.MsgOptionText("❌ Ошибка получения списка задач", false))
+			log.Printf("❌ Ошибка получения задач: %s", err)
+			return err
+		}
+
+		var taskList string
+		if len(tasks) == 0 {
+			taskList = "🔹 Нет запланированных задач."
+		} else {
+			taskList = "*📋 Запланированные задачи:*"
+			for _, task := range tasks {
+				taskList += fmt.Sprintf("\n- `%s` (%s)", task["branch"], task["project"])
+			}
+		}
+
+		attachment = slack.Attachment{
+			Title:      "Автослияние по расписанию",
+			Text:       taskList,
+			Fallback:   "Нет запланированных задач",
+			CallbackID: "cron_task",
+			Color:      "#3AA3E3",
+			Actions: []slack.AttachmentAction{
+				{Name: "add_cron", Text: "➕ Добавить", Type: "button", Value: "add"},
+				{Name: "delete_cron", Text: "🗑 Удалить", Type: "button", Value: "delete"},
+			},
+		}
+
 	case strings.Contains(text, "help") || strings.Contains(text, "h"):
 		commands := "Available commands:\n" +
 			"`@onestate_merge_bot help/h` - list of commands\n" +
@@ -639,12 +969,14 @@ func HandleAppMentionEventToBot(event *slackevents.AppMentionEvent, client *slac
 		attachment.Color = "#4af030"
 
 	case strings.Contains(text, "delete_all") && strings.Contains(text, "666"):
-		client.PostMessage(event.Channel, slack.MsgOptionText("🔄 Deleting all messages...", false))
+		client.PostEphemeral(event.Channel, user.ID, slack.MsgOptionText("🔄 Deleting all messages...", false))
+		log.Println("🔄 Deleting all messages...")
 		err := DeleteAllMessages(event.Channel, client)
 		if err != nil {
-			client.PostMessage(event.Channel, slack.MsgOptionText(fmt.Sprintf("❌ Error deleting messages: %s", err), false))
+			client.PostEphemeral(event.Channel, user.ID, slack.MsgOptionText(fmt.Sprintf("❌ Error deleting messages: %s", err), false))
 		} else {
-			client.PostMessage(event.Channel, slack.MsgOptionText("✅ All messages have been deleted!", false))
+			client.PostEphemeral(event.Channel, user.ID, slack.MsgOptionText("✅ All messages have been deleted!", false))
+			log.Println("✅ All messages have been deleted!")
 		}
 		return nil
 
@@ -659,4 +991,76 @@ func HandleAppMentionEventToBot(event *slackevents.AppMentionEvent, client *slac
 		return fmt.Errorf("❌ failed to post message: %w", err)
 	}
 	return nil
+}
+
+func main() {
+	// Загружаем переменные окружения
+	godotenv.Load(".env")
+
+	token := os.Getenv("SLACK_AUTH_TOKEN")
+	appToken := os.Getenv("SLACK_APP_TOKEN")
+
+	db, err := InitDB()
+	if err != nil {
+		log.Fatalf("❌ Database initialization error: %v", err)
+	}
+
+	// Инициализация Slack клиента
+	log.Println("⏳ Chat bot starting...")
+	client := slack.New(token, slack.OptionDebug(true), slack.OptionAppLevelToken(appToken))
+	StartCronWorker(db, client)
+	socketClient := socketmode.New(
+		client,
+		socketmode.OptionDebug(true),
+		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	defer cancel()
+
+	// Запуск обработчика событий в отдельной горутине
+	go func(ctx context.Context, client *slack.Client, socketClient *socketmode.Client) {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("🛑 Shutting down socketmode listener")
+				return
+			case event := <-socketClient.Events:
+
+				switch event.Type {
+
+				case socketmode.EventTypeInteractive:
+					callback, ok := event.Data.(slack.InteractionCallback)
+					if !ok {
+						log.Printf("⚠️ Ignored non-interactive callback event: %v\n", event)
+						continue
+					}
+
+					socketClient.Ack(*event.Request)
+					err := HandleInteractiveEvent(callback, client)
+					if err != nil {
+						log.Printf("❌ Error handling interactive event: %v\n", err)
+					}
+
+				case socketmode.EventTypeEventsAPI:
+
+					eventsAPI, ok := event.Data.(slackevents.EventsAPIEvent)
+					if !ok {
+						log.Printf("⚠️ Could not type cast the event to the EventsAPI: %v\n", event)
+						continue
+					}
+
+					socketClient.Ack(*event.Request)
+					err := HandleEventMessage(eventsAPI, client)
+					if err != nil {
+						log.Fatal(err)
+					}
+				}
+			}
+		}
+	}(ctx, client, socketClient)
+	log.Println("✅ Chat bot started")
+
+	socketClient.Run()
 }
