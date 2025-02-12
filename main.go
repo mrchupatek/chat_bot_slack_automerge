@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -130,9 +131,17 @@ type MergeData struct {
 	Squash          bool   `json:"squash"`
 }
 
+type CronTask struct {
+	UserID  string
+	Branch  string
+	Project string
+}
+
+var adminIDs []string
+
 // InitDB Создание базы данных для хранения cron-задач
 func InitDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", "automerge.db")
+	db, err := sql.Open("sqlite3", "storage/automerge.db")
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +160,15 @@ func InitDB() (*sql.DB, error) {
 	return db, nil
 }
 
+func IsAdmin(userID string) bool {
+	for _, admin := range adminIDs {
+		if admin == userID {
+			return true
+		}
+	}
+	return false
+}
+
 // AddCronTask Добавление задачи в cron-таблицу
 func AddCronTask(db *sql.DB, userID, branch, project string) error {
 	_, err := db.Exec("INSERT INTO cron_merge (user_id, branch, project) VALUES (?, ?, ?)", userID, branch, project)
@@ -164,25 +182,47 @@ func DeleteCronTask(db *sql.DB, userID, branch, project string) error {
 }
 
 // GetCronTasks Получение всех задач для пользователя
-func GetCronTasks(db *sql.DB, userID string) ([]map[string]interface{}, error) {
-
-	rows, err := db.Query("SELECT id, branch, project FROM cron_merge WHERE user_id = ?", userID)
+func GetCronTasks(db *sql.DB, userID string) ([]CronTask, error) {
+	rows, err := db.Query("SELECT branch, project FROM cron_merge WHERE user_id = ?", userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var tasks []map[string]interface{}
+	var tasks []CronTask
 	for rows.Next() {
-		var id int
 		var branch, project string
-		if err := rows.Scan(&id, &branch, &project); err != nil {
+		if err := rows.Scan(&branch, &project); err != nil {
 			return nil, err
 		}
-		tasks = append(tasks, map[string]interface{}{
-			"id":      id,
-			"branch":  branch,
-			"project": project,
+		tasks = append(tasks, CronTask{
+			UserID:  userID,
+			Branch:  branch,
+			Project: project,
+		})
+
+	}
+	return tasks, nil
+}
+
+// GetAllCronTasks Получение всех задач
+func GetAllCronTasks(db *sql.DB) ([]CronTask, error) {
+	rows, err := db.Query("SELECT user_id, branch, project FROM cron_merge")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []CronTask
+	for rows.Next() {
+		var userID, branch, project string
+		if err := rows.Scan(&userID, &branch, &project); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, CronTask{
+			UserID:  userID,
+			Branch:  branch,
+			Project: project,
 		})
 	}
 	return tasks, nil
@@ -191,7 +231,7 @@ func GetCronTasks(db *sql.DB, userID string) ([]map[string]interface{}, error) {
 // StartCronWorker Горутина для выполнения задач в 9 утра по МСК
 func StartCronWorker(db *sql.DB, client *slack.Client) {
 	scheduler := gocron.NewScheduler(time.UTC)
-	scheduler.Every(1).Day().At("07:43").Do(func() { // 9 AM MSK = 6 AM UTC
+	scheduler.Every(1).Day().At("06:00").Do(func() { // 9 AM MSK = 6 AM UTC
 		rows, err := db.Query("SELECT user_id, branch, project FROM cron_merge")
 		if err != nil {
 			log.Printf("❌ Error retrieving cron tasks: %v", err)
@@ -432,8 +472,8 @@ func HandleInteractiveEvent(callback slack.InteractionCallback, client *slack.Cl
 
 				var options []slack.DialogSelectOption
 				for _, task := range tasks {
-					text := fmt.Sprintf("%s (%s)", task["branch"], task["project"])
-					value := fmt.Sprintf("%s|%s", task["branch"], task["project"])
+					text := fmt.Sprintf("%s (%s)", task.Branch, task.Project)
+					value := fmt.Sprintf("%s|%s", task.Branch, task.Project)
 					options = append(options, slack.DialogSelectOption{Label: text, Value: value})
 				}
 
@@ -531,7 +571,22 @@ func HandleInteractiveEvent(callback slack.InteractionCallback, client *slack.Cl
 
 // CreateMergeForAllProject Создаем МР для всех проектов
 func CreateMergeForAllProject(channelID, clientBranch, serverBranch, userID string, client *slack.Client) {
-
+	err := CheckBranches(clientBranch, projectIDGitlab["client"])
+	if err != nil {
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for client `%s`. \n"+
+			"❌ Error: `%v`", clientBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", clientBranch, err)
+		return
+	}
+	err = CheckBranches(serverBranch, projectIDGitlab["server"])
+	if err != nil {
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for server `%s`. \n"+
+			"❌ Error: `%v`", serverBranch, err), false))
+		log.Printf("⚠️ Cannot create MR for client `%s` \n"+
+			"❌ Error: %v\n", serverBranch, err)
+		return
+	}
 	clientResp, err := CreateMR(clientBranch, projectIDGitlab["client"])
 	if err != nil {
 		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create MR for client `%s`. \n"+
@@ -616,6 +671,29 @@ func WaitForStatus(iid, projectID int) (*RespBodyMR, error) {
 
 	var lastResp *RespBodyMR
 
+	reasons := map[string]string{
+		"approvals_syncing":          "The merge request’s approvals are syncing.",
+		"ci_must_pass":               "A CI/CD pipeline must succeed before merge.",
+		"ci_still_running":           "A CI/CD pipeline is still running.",
+		"commits_status":             "Source branch should exist, and contain commits.",
+		"conflict":                   "Conflicts exist between the source and target branches.",
+		"discussions_not_resolved":   "All discussions must be resolved before merge.",
+		"draft_status":               "Can’t merge because the merge request is a draft.",
+		"jira_association_missing":   "The title or description must reference a Jira issue.",
+		"merge_request_blocked":      "Blocked by another merge request.",
+		"merge_time":                 "May not be merged until after the specified time.",
+		"need_rebase":                "The merge request must be rebased.",
+		"not_approved":               "Approval is required before merge.",
+		"not_open":                   "The merge request must be open before merge.",
+		"preparing":                  "Merge request diff is being created.",
+		"requested_changes":          "The merge request has reviewers who have requested changes.",
+		"security_policy_violations": "All security policies must be satisfied.",
+		"status_checks_must_pass":    "All status checks must pass before merge.",
+		"unchecked":                  "Git has not yet tested if a valid merge is possible.",
+		"locked_paths":               "Paths locked by other users must be unlocked before merging.",
+		"locked_lfs_files":           "LFS files locked by other users must be unlocked before merge.",
+	}
+
 	for time.Now().Before(deadline) {
 		resp, err := CheckMR(iid, projectID)
 		if err != nil {
@@ -623,16 +701,18 @@ func WaitForStatus(iid, projectID int) (*RespBodyMR, error) {
 		}
 		lastResp = resp
 
-		switch resp.DetailedMergeStatus {
-		case "mergeable":
+		if resp.DetailedMergeStatus == "mergeable" {
 			return resp, nil
-		case "checking":
+		}
+
+		if resp.DetailedMergeStatus == "checking" || resp.DetailedMergeStatus == "preparing" {
 			<-ticker.C
 			continue
 		}
 
-		if resp.MergeStatus == "cannot_be_merged" {
-			return resp, errors.New("cannot_be_merged")
+		// Если detailed_merge_status в списке, возвращаем ошибку с пояснением
+		if reason, exists := reasons[resp.DetailedMergeStatus]; exists {
+			return resp, fmt.Errorf("%s - %s", resp.DetailedMergeStatus, reason)
 		}
 
 		<-ticker.C
@@ -643,13 +723,20 @@ func WaitForStatus(iid, projectID int) (*RespBodyMR, error) {
 
 // CreateMerge Главная функция логики создания и выполнения МР
 func CreateMerge(channelID, branchName, buttonValue, userID string, client *slack.Client) {
-
+	err := CheckBranches(branchName, projectIDGitlab[buttonValue])
+	if err != nil {
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("⚠️ Cannot create `%s` MR for `%s`. \n"+
+			"❌ Error: `%v`", buttonValue, branchName, err), false))
+		log.Printf("⚠️ Cannot create `%s` MR for `%s` \n"+
+			"❌ Error: %v\n", buttonValue, branchName, err)
+		return
+	}
 	resp, err := CreateMR(branchName, projectIDGitlab[buttonValue])
 	if err != nil {
-		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be create mr `%s`. \n"+
-			"❌ Error: `%v`", branchName, err), false))
-		log.Printf("❌ Cannot be create mr `%s`. \n"+
-			"❌ Error: `%v`", branchName, err)
+		client.PostEphemeral(channelID, userID, slack.MsgOptionText(fmt.Sprintf("❌ Cannot be create `%s` MR for `%s`. \n"+
+			"❌ Error: `%v`", buttonValue, branchName, err), false))
+		log.Printf("❌ Cannot be create `%s` mr for `%s`. \n"+
+			"❌ Error: `%v`", buttonValue, branchName, err)
 		return
 	}
 
@@ -686,11 +773,14 @@ func CreateMerge(channelID, branchName, buttonValue, userID string, client *slac
 func CreateMR(branchName string, projectID int) (*RespBodyMR, error) {
 	gitlabURL := os.Getenv("GITLAB_URL")
 	var token string
+	var projectName string
 	var resp *RespBodyMR
 	if projectID == 66 {
 		token = os.Getenv("GITLAB_CLIENT_TOKEN")
+		projectName = "clm-client"
 	} else if projectID == 65 {
 		token = os.Getenv("GITLAB_SERVER_TOKEN")
+		projectName = "clm-server"
 	}
 
 	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests", gitlabURL, projectID)
@@ -740,6 +830,19 @@ func CreateMR(branchName string, projectID int) (*RespBodyMR, error) {
 		return nil, err
 	}
 	if res.StatusCode == 409 {
+		var errResp map[string][]string
+		if json.Unmarshal(body, &errResp) == nil {
+			if messages, exists := errResp["message"]; exists && len(messages) > 0 {
+				re := regexp.MustCompile(`Another open merge request already exists for this source branch: !(\d+)`)
+				match := re.FindStringSubmatch(messages[0])
+				if len(match) > 1 {
+					mrID := match[1]
+					mrURL := fmt.Sprintf("%s/clm-project/%s/-/merge_requests/%s",
+						gitlabURL, projectName, mrID)
+					return nil, fmt.Errorf("another open merge request already exists for this source branch: %s", mrURL)
+				}
+			}
+		}
 		return nil, errors.New(string(body))
 	}
 	return resp, nil
@@ -789,6 +892,54 @@ func CheckMR(iid int, projectID int) (*RespBodyMR, error) {
 		return nil, errors.New("Error check " + res.Status + ": " + string(body))
 	}
 	return resp, err
+}
+
+func CheckBranches(branchName string, projectID int) error {
+	branchName = strings.TrimSpace(branchName)
+	if len(branchName) == 0 {
+		return errors.New("branch name cannot be empty")
+	}
+
+	encodedBranchName := strings.ReplaceAll(branchName, "/", "%2F")
+
+	gitlabURL := os.Getenv("GITLAB_URL")
+	url := fmt.Sprintf("%s/api/v4/projects/%d/repository/branches/%s", gitlabURL, projectID, encodedBranchName)
+	method := "GET"
+	var token string
+	if projectID == 66 {
+		token = os.Getenv("GITLAB_CLIENT_TOKEN")
+	} else if projectID == 65 {
+		token = os.Getenv("GITLAB_SERVER_TOKEN")
+	}
+	client := &http.Client{}
+	req, err := http.NewRequest(method, url, nil)
+
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+
+	res, err := client.Do(req)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 404 {
+		return fmt.Errorf("branch '%s' not found", branchName)
+	}
+	if res.StatusCode != 200 {
+		return fmt.Errorf("unexpected response status: %d", res.StatusCode)
+	}
+	//body, err := io.ReadAll(res.Body)
+	//if err != nil {
+	//	fmt.Println(err)
+	//	return err
+	//}
+	//fmt.Println(string(body))
+	return nil
 }
 
 // MergeMR Выполняем МР
@@ -931,40 +1082,51 @@ func HandleAppMentionEventToBot(event *slackevents.AppMentionEvent, client *slac
 		if err != nil {
 			log.Fatalf("❌ Database initialization error: %v", err)
 		}
-
-		tasks, err := GetCronTasks(db, event.User)
+		var tasks []CronTask
+		fmt.Println("User ", event.User)
+		if IsAdmin(event.User) {
+			tasks, err = GetAllCronTasks(db)
+		} else {
+			tasks, err = GetCronTasks(db, event.User)
+		}
 		if err != nil {
-			client.PostEphemeral(event.Channel, event.User, slack.MsgOptionText("❌ Ошибка получения списка задач", false))
-			log.Printf("❌ Ошибка получения задач: %s", err)
+			client.PostEphemeral(event.Channel, event.User, slack.MsgOptionText("❌ Error getting task list", false))
+			log.Printf("❌ Error getting tasks: %s", err)
 			return err
 		}
 
 		var taskList string
 		if len(tasks) == 0 {
-			taskList = "🔹 Нет запланированных задач."
-		} else {
-			taskList = "*📋 Запланированные задачи:*"
+			taskList = "🔹 There are no cron tasks."
+		} else if IsAdmin(event.User) {
+			taskList = "*📋 All cron tasks:*"
 			for _, task := range tasks {
-				taskList += fmt.Sprintf("\n- `%s` (%s)", task["branch"], task["project"])
+				taskList += fmt.Sprintf("\n- 👤: `<@%s>` | Branch: `%s` | Project: `%s`", task.UserID, task.Branch, task.Project)
+			}
+		} else {
+			taskList = "*📋 Cron tasks:*"
+			for _, task := range tasks {
+				taskList += fmt.Sprintf("\n- `%s` (%s)", task.Branch, task.Project)
 			}
 		}
 
 		attachment = slack.Attachment{
-			Title:      "Автослияние по расписанию",
+			Title:      "Auto merge on cron",
 			Text:       taskList,
-			Fallback:   "Нет запланированных задач",
+			Fallback:   "There are no cron tasks.",
 			CallbackID: "cron_task",
 			Color:      "#3AA3E3",
 			Actions: []slack.AttachmentAction{
-				{Name: "add_cron", Text: "➕ Добавить", Type: "button", Value: "add"},
-				{Name: "delete_cron", Text: "🗑 Удалить", Type: "button", Value: "delete"},
+				{Name: "add_cron", Text: "➕ Add", Type: "button", Value: "add"},
+				{Name: "delete_cron", Text: "🗑 Delete", Type: "button", Value: "delete"},
 			},
 		}
 
 	case strings.Contains(text, "help") || strings.Contains(text, "h"):
 		commands := "Available commands:\n" +
 			"`@onestate_merge_bot help/h` - list of commands\n" +
-			"`@onestate_merge_bot merge/mr` - merge master to select branch command\n"
+			"`@onestate_merge_bot merge/mr` - merge master to select branch command\n" +
+			"`@onestate_merge_bot cron/cr` - cron scheduler for automerge\n"
 		attachment.Text = fmt.Sprintf("👋 Hello, *%s*!\n%s", user.Name, commands)
 		attachment.Color = "#4af030"
 
@@ -1007,11 +1169,12 @@ func main() {
 
 	// Инициализация Slack клиента
 	log.Println("⏳ Chat bot starting...")
-	client := slack.New(token, slack.OptionDebug(true), slack.OptionAppLevelToken(appToken))
+	client := slack.New(token, slack.OptionDebug(false), slack.OptionAppLevelToken(appToken))
+	adminIDs = strings.Split(os.Getenv("ADMIN_CHAT"), ",")
 	StartCronWorker(db, client)
 	socketClient := socketmode.New(
 		client,
-		socketmode.OptionDebug(true),
+		socketmode.OptionDebug(false),
 		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
 	)
 
