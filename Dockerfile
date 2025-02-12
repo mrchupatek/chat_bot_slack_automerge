@@ -12,5 +12,7 @@ FROM golang:1.23.5
 WORKDIR /app
 COPY --from=builder /app/chat_bot .
 COPY .env /app/.env
+RUN mkdir -p /app/storage/
+COPY storage/automerge_example.db /app/storage/automerge.db
 
 ENTRYPOINT ["./chat_bot"]
